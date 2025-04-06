@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Audio Transcription</title>
+  <style>
+    #transcription-output {
+      margin-top: 20px;
+      padding: 10px;
+      border: 1px solid #ddd;
+      min-height: 50px;
+    }
+    #recordButton, #stopButton, #transcribeButton {
+      margin-top: 10px;
+      padding: 10px;
+    }
+    #waveform {
+      width: 100%;
+      height: 100px;
+      margin-top: 20px;
+    }
+    #audioPlayer {
+      margin-top: 20px;
+    }
+    #audioElement {
+      width: 100%;
+    }
+    #playbackHint {
+      font-size: 12px;
+      margin-top: 5px;
+      color: gray;
+    }
+  </style>
+  <!-- WaveSurfer.js Library -->
+  <script src="https://unpkg.com/wavesurfer.js"></script>
+</head>
+<body>
+  <h1>Record Audio for Transcription</h1>
+
+  <button id="recordButton">Start Recording</button>
+  <button id="stopButton" disabled>Stop Recording</button>
+  <button id="transcribeButton" disabled>Transcribe</button>
+
+  <div id="waveform"></div> <!-- Waveform display -->
+
+  <div id="audioPlayer">
+    <audio id="audioElement" controls>
+      Your browser does not support the audio element.
+    </audio>
+  </div> <!-- Audio playback -->
+
+  <div id="playbackHint">Click the play button above to hear your recording.</div> <!-- Hint for playback -->
+
+  <h2>Transcription Output:</h2>
+  <div id="transcription-output">Waiting for transcription...</div>
+
+  <script>
+    let audioContext;
+    let processor;
+    let source;
+    let audioDataBuffer = []; // Stores Float32Array chunks
+    let recording = false;
+    let waveSurfer;
+
+    // Initialize WaveSurfer.js for waveform visualization
+    function initWaveform() {
+      waveSurfer = WaveSurfer.create({
+        container: '#waveform',
+        waveColor: 'gray',
+        progressColor: 'green',
+        height: 100
+      });
+    }
+
+    // Start recording using the Web Audio API at (attempted) 16kHz
+    document.getElementById('recordButton').addEventListener('click', async () => {
+      // Clear any previous recording data
+      audioDataBuffer = [];
+
+      // Create an AudioContext with desired sample rate (16kHz)
+      try {
+        audioContext = new AudioContext({ sampleRate: 16000 });
+      } catch (e) {
+        console.warn("16kHz sample rate not supported; using default sample rate");
+        audioContext = new AudioContext();
+      }
+
+      // Request microphone access
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      source = audioContext.createMediaStreamSource(stream);
+
+      // Create a ScriptProcessorNode (buffer size can be adjusted)
+      const bufferSize = 4096;
+      processor = audioContext.createScriptProcessor(bufferSize, 1, 1);
+
+      processor.onaudioprocess = function(e) {
+        if (!recording) return;
+        // Get audio samples from the input buffer (mono channel)
+        const channelData = e.inputBuffer.getChannelData(0);
+        // Copy the data to avoid referencing issues
+        audioDataBuffer.push(new Float32Array(channelData));
+      };
+
+      // Connect the processing graph: microphone -> processor -> (to speakers, optional)
+      source.connect(processor);
+      processor.connect(audioContext.destination);
+
+      recording = true;
+      document.getElementById('recordButton').disabled = true;
+      document.getElementById('stopButton').disabled = false;
+    });
+
+    // Stop recording and process the recorded audio
+    document.getElementById('stopButton').addEventListener('click', () => {
+      recording = false;
+
+      // Disconnect audio nodes
+      if (processor) processor.disconnect();
+      if (source) source.disconnect();
+      if (audioContext && audioContext.state !== 'closed') audioContext.close();
+
+      // Merge recorded chunks into a single Float32Array
+      const mergedBuffer = mergeBuffers(audioDataBuffer);
+      // Encode the merged buffer into a WAV Blob (using 16kHz and mono)
+      const wavBlob = encodeWAV(mergedBuffer, 16000, 1);
+
+      // Update the UI: waveform display and audio player
+      updateAudioPlayer(wavBlob);
+      displayWaveform(wavBlob);
+      document.getElementById('transcribeButton').disabled = false;
+      document.getElementById('recordButton').disabled = false;
+      document.getElementById('stopButton').disabled = true;
+    });
+
+    // Merge an array of Float32Array buffers into one
+    function mergeBuffers(buffers) {
+      let totalLength = buffers.reduce((sum, current) => sum + current.length, 0);
+      let result = new Float32Array(totalLength);
+      let offset = 0;
+      buffers.forEach(buffer => {
+        result.set(buffer, offset);
+        offset += buffer.length;
+      });
+      return result;
+    }
+
+    // Encode a Float32Array of PCM samples into a WAV file Blob
+    function encodeWAV(samples, sampleRate, numChannels) {
+      const bytesPerSample = 2;
+      const bufferLength = samples.length * bytesPerSample;
+      const headerLength = 44;
+      const buffer = new ArrayBuffer(headerLength + bufferLength);
+      const view = new DataView(buffer);
+
+      let offset = 0;
+      function writeString(s) {
+        for (let i = 0; i < s.length; i++) {
+          view.setUint8(offset++, s.charCodeAt(i));
+        }
+      }
+
+      // RIFF header
+      writeString('RIFF');
+      view.setUint32(offset, 36 + bufferLength, true); offset += 4;
+      writeString('WAVE');
+
+      // fmt subchunk
+      writeString('fmt ');
+      view.setUint32(offset, 16, true); offset += 4; // Subchunk1Size for PCM
+      view.setUint16(offset, 1, true); offset += 2;    // PCM format
+      view.setUint16(offset, numChannels, true); offset += 2;
+      view.setUint32(offset, sampleRate, true); offset += 4;
+      view.setUint32(offset, sampleRate * numChannels * bytesPerSample, true); offset += 4;
+      view.setUint16(offset, numChannels * bytesPerSample, true); offset += 2;
+      view.setUint16(offset, 16, true); offset += 2;     // Bits per sample
+
+      // data subchunk
+      writeString('data');
+      view.setUint32(offset, bufferLength, true); offset += 4;
+
+      // Write the PCM samples as 16-bit little-endian
+      for (let i = 0; i < samples.length; i++, offset += 2) {
+        let s = Math.max(-1, Math.min(1, samples[i])); // Clamp the sample
+        view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      }
+
+      return new Blob([view], { type: 'audio/wav' });
+    }
+
+    // Update the audio player element with the recorded WAV file
+    function updateAudioPlayer(file) {
+      const audioElement = document.getElementById('audioElement');
+      audioElement.src = URL.createObjectURL(file);
+      audioElement.load();
+    }
+
+    // Load the WAV file into WaveSurfer.js for visualization
+    function displayWaveform(file) {
+      waveSurfer.load(URL.createObjectURL(file));
+    }
+
+    // Upload the audio file for transcription
+    function uploadFile(file) {
+      const formData = new FormData();
+      formData.append('audio', file);
+
+      fetch('http://scribesmart.co/transcribe', {  // Endpoint served by Nginx and Gunicorn
+        method: 'POST',
+        body: formData
+      })
+      .then(response => response.json())
+      .then(data => {
+        if (data.transcription) {
+          document.getElementById('transcription-output').innerText = data.transcription;
+        } else {
+          document.getElementById('transcription-output').innerText = 'Error: No transcription received.';
+        }
+      })
+      .catch(error => {
+        document.getElementById('transcription-output').innerText = 'Error uploading file: ' + error.message;
+      });
+    }
+
+    // When the Transcribe button is clicked, fetch the current audio file and upload it
+    document.getElementById('transcribeButton').addEventListener('click', () => {
+      const audioSrc = document.getElementById('audioElement').src;
+      if (audioSrc) {
+        // Fetch the audio file from the audio element's source URL
+        fetch(audioSrc)
+        .then(response => response.blob())
+        .then(blob => {
+          uploadFile(blob);
+        })
+        .catch(error => {
+          document.getElementById('transcription-output').innerText = 'Error fetching audio file: ' + error.message;
+        });
+      }
+    });
+
+    // Initialize WaveSurfer.js once the page loads
+    initWaveform();
+  </script>
+</body>
+</html>
